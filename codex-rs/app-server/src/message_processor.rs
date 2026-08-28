@@ -58,6 +58,7 @@ use crate::skills_watcher::SkillsWatcher;
 use crate::thread_state::ConnectionCapabilities;
 use crate::thread_state::ThreadStateManager;
 use crate::transport::AppServerTransport;
+use crate::transport::ConnectionOrigin;
 use crate::transport::RemoteControlHandle;
 use crate::turn_cost_worker::TurnCostWorker;
 use codex_analytics::AnalyticsEventsClient;
@@ -637,6 +638,7 @@ impl MessageProcessor {
     pub(crate) async fn process_request(
         self: &Arc<Self>,
         connection_id: ConnectionId,
+        origin: ConnectionOrigin,
         request: JSONRPCRequest,
         transport: &AppServerTransport,
         session: Arc<ConnectionSessionState>,
@@ -677,6 +679,7 @@ impl MessageProcessor {
                         self.handle_client_request(
                             request_id.clone(),
                             codex_request,
+                            origin,
                             Arc::clone(&session),
                             /*outbound_initialized*/ None,
                             request_context.clone(),
@@ -700,6 +703,7 @@ impl MessageProcessor {
     pub(crate) async fn process_client_request(
         self: &Arc<Self>,
         connection_id: ConnectionId,
+        origin: ConnectionOrigin,
         request: ClientRequest,
         session: Arc<ConnectionSessionState>,
         outbound_initialized: &AtomicBool,
@@ -734,6 +738,7 @@ impl MessageProcessor {
                     .handle_client_request(
                         request_id.clone(),
                         request,
+                        origin,
                         Arc::clone(&session),
                         Some(outbound_initialized),
                         request_context.clone(),
@@ -823,6 +828,7 @@ impl MessageProcessor {
     pub(crate) async fn connection_initialized(
         &self,
         connection_id: ConnectionId,
+        origin: ConnectionOrigin,
         request_attestation: bool,
     ) {
         self.account_processor
@@ -833,6 +839,7 @@ impl MessageProcessor {
                 ConnectionCapabilities {
                     request_attestation,
                 },
+                origin,
             )
             .await;
     }
@@ -938,6 +945,7 @@ impl MessageProcessor {
         self: &Arc<Self>,
         connection_request_id: ConnectionRequestId,
         codex_request: ClientRequest,
+        origin: ConnectionOrigin,
         session: Arc<ConnectionSessionState>,
         // `Some(...)` means the caller wants initialize to immediately mark the
         // connection outbound-ready. Websocket JSON-RPC calls pass `None` so
@@ -958,7 +966,7 @@ impl MessageProcessor {
                 )
                 .await?;
             if connection_initialized {
-                self.connection_initialized(connection_id, session.request_attestation())
+                self.connection_initialized(connection_id, origin, session.request_attestation())
                     .await;
             }
             return Ok(());

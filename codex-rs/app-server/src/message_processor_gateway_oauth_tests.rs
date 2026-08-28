@@ -40,6 +40,7 @@ async fn send_request(
     processor
         .process_request(
             TEST_CONNECTION_ID,
+            session.origin,
             serde_json::from_value(request).expect("JSON-RPC request"),
             &AppServerTransport::Stdio,
             Arc::clone(session),

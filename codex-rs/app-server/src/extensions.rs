@@ -313,6 +313,7 @@ mod tests {
     use crate::outgoing_message::OutgoingEnvelope;
     use crate::outgoing_message::OutgoingMessage;
     use crate::thread_state::ConnectionCapabilities;
+    use crate::transport::ConnectionOrigin;
 
     use super::*;
 
@@ -411,7 +412,11 @@ mod tests {
         let thread_state_manager = ThreadStateManager::new();
         for connection_id in [subscribed_connection, unrelated_connection] {
             thread_state_manager
-                .connection_initialized(connection_id, ConnectionCapabilities::default())
+                .connection_initialized(
+                    connection_id,
+                    ConnectionCapabilities::default(),
+                    ConnectionOrigin::Stdio,
+                )
                 .await;
         }
         thread_state_manager
@@ -470,7 +475,11 @@ mod tests {
         let subscribed_connection = ConnectionId(1);
         let thread_state_manager = ThreadStateManager::new();
         thread_state_manager
-            .connection_initialized(subscribed_connection, ConnectionCapabilities::default())
+            .connection_initialized(
+                subscribed_connection,
+                ConnectionCapabilities::default(),
+                ConnectionOrigin::Stdio,
+            )
             .await;
         let sink = app_server_extension_event_sink(outgoing, thread_state_manager.clone());
 
@@ -528,7 +537,11 @@ mod tests {
         let subscribed_connection = ConnectionId(1);
         let thread_state_manager = ThreadStateManager::new();
         thread_state_manager
-            .connection_initialized(subscribed_connection, ConnectionCapabilities::default())
+            .connection_initialized(
+                subscribed_connection,
+                ConnectionCapabilities::default(),
+                ConnectionOrigin::Stdio,
+            )
             .await;
         thread_state_manager
             .try_ensure_connection_subscribed(

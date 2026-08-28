@@ -535,6 +535,7 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
                                 processor
                                     .process_client_request(
                                         IN_PROCESS_CONNECTION_ID,
+                                        crate::transport::ConnectionOrigin::InProcess,
                                         *request,
                                         Arc::clone(&session),
                                         &outbound_initialized,
