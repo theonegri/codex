@@ -148,6 +148,7 @@ mod thread_processor_behavior_tests {
     use super::super::*;
     use crate::outgoing_message::OutgoingEnvelope;
     use crate::outgoing_message::OutgoingMessage;
+    use crate::transport::ConnectionOrigin;
     use anyhow::Result;
     use chrono::DateTime;
     use chrono::Utc;
@@ -1226,7 +1227,11 @@ mod thread_processor_behavior_tests {
         let (cancel_tx, cancel_rx) = oneshot::channel();
 
         manager
-            .connection_initialized(connection, ConnectionCapabilities::default())
+            .connection_initialized(
+                connection,
+                ConnectionCapabilities::default(),
+                ConnectionOrigin::Stdio,
+            )
             .await;
         manager
             .try_ensure_connection_subscribed(
@@ -1274,10 +1279,18 @@ mod thread_processor_behavior_tests {
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
 
         manager
-            .connection_initialized(connection_a, ConnectionCapabilities::default())
+            .connection_initialized(
+                connection_a,
+                ConnectionCapabilities::default(),
+                ConnectionOrigin::Stdio,
+            )
             .await;
         manager
-            .connection_initialized(connection_b, ConnectionCapabilities::default())
+            .connection_initialized(
+                connection_b,
+                ConnectionCapabilities::default(),
+                ConnectionOrigin::Stdio,
+            )
             .await;
         manager
             .try_ensure_connection_subscribed(
@@ -1323,10 +1336,18 @@ mod thread_processor_behavior_tests {
         let connection_b = ConnectionId(2);
 
         manager
-            .connection_initialized(connection_a, ConnectionCapabilities::default())
+            .connection_initialized(
+                connection_a,
+                ConnectionCapabilities::default(),
+                ConnectionOrigin::Stdio,
+            )
             .await;
         manager
-            .connection_initialized(connection_b, ConnectionCapabilities::default())
+            .connection_initialized(
+                connection_b,
+                ConnectionCapabilities::default(),
+                ConnectionOrigin::Stdio,
+            )
             .await;
         manager
             .try_ensure_connection_subscribed(
@@ -1372,7 +1393,11 @@ mod thread_processor_behavior_tests {
         let thread_id = ThreadId::from_string("ba62fd70-2ec2-4b1b-9d94-355694332dd2")?;
         let connection = ConnectionId(1);
         manager
-            .connection_initialized(connection, ConnectionCapabilities::default())
+            .connection_initialized(
+                connection,
+                ConnectionCapabilities::default(),
+                ConnectionOrigin::Stdio,
+            )
             .await;
 
         let wait_for_subscriber = manager.wait_for_thread_subscriber(thread_id);
@@ -1398,7 +1423,11 @@ mod thread_processor_behavior_tests {
         let connection = ConnectionId(1);
 
         manager
-            .connection_initialized(connection, ConnectionCapabilities::default())
+            .connection_initialized(
+                connection,
+                ConnectionCapabilities::default(),
+                ConnectionOrigin::Stdio,
+            )
             .await;
         let threads_to_unload = manager.remove_connection(connection).await;
         assert_eq!(threads_to_unload, Vec::<ThreadId>::new());
@@ -1432,6 +1461,7 @@ mod thread_processor_behavior_tests {
                 ConnectionCapabilities {
                     request_attestation: true,
                 },
+                ConnectionOrigin::Stdio,
             )
             .await;
         manager
@@ -1440,6 +1470,7 @@ mod thread_processor_behavior_tests {
                 ConnectionCapabilities {
                     request_attestation: true,
                 },
+                ConnectionOrigin::Stdio,
             )
             .await;
         manager
@@ -1448,10 +1479,15 @@ mod thread_processor_behavior_tests {
                 ConnectionCapabilities {
                     request_attestation: true,
                 },
+                ConnectionOrigin::Stdio,
             )
             .await;
         manager
-            .connection_initialized(unsupported_connection, ConnectionCapabilities::default())
+            .connection_initialized(
+                unsupported_connection,
+                ConnectionCapabilities::default(),
+                ConnectionOrigin::Stdio,
+            )
             .await;
 
         assert!(
@@ -1487,6 +1523,121 @@ mod thread_processor_behavior_tests {
                 .await,
             Some(unrelated_supported_connection)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_control_thread_start_also_subscribes_local_stdio_connections() -> Result<()> {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::from_string("4f1ddc9b-e4f5-4c59-b0d7-1ea3db8c9e4a")?;
+        let remote_control_connection = ConnectionId(1);
+        let stdio_connection = ConnectionId(2);
+        let websocket_connection = ConnectionId(3);
+        let in_process_connection = ConnectionId(4);
+
+        manager
+            .connection_initialized(
+                remote_control_connection,
+                ConnectionCapabilities::default(),
+                ConnectionOrigin::RemoteControl,
+            )
+            .await;
+        manager
+            .connection_initialized(
+                stdio_connection,
+                ConnectionCapabilities::default(),
+                ConnectionOrigin::Stdio,
+            )
+            .await;
+        manager
+            .connection_initialized(
+                websocket_connection,
+                ConnectionCapabilities::default(),
+                ConnectionOrigin::WebSocket,
+            )
+            .await;
+        manager
+            .connection_initialized(
+                in_process_connection,
+                ConnectionCapabilities::default(),
+                ConnectionOrigin::InProcess,
+            )
+            .await;
+
+        manager
+            .try_ensure_connection_subscribed(
+                thread_id,
+                remote_control_connection,
+                /*experimental_raw_events*/ false,
+            )
+            .await
+            .expect("remote-control connection should be live");
+        for connection_id in manager
+            .local_stdio_connection_ids_for_remote_control_thread_start(remote_control_connection)
+            .await
+        {
+            manager
+                .try_ensure_connection_subscribed(
+                    thread_id,
+                    connection_id,
+                    /*experimental_raw_events*/ false,
+                )
+                .await
+                .expect("stdio companion should be live");
+        }
+
+        let mut subscribed_connection_ids = manager.subscribed_connection_ids(thread_id).await;
+        subscribed_connection_ids.sort_by_key(|connection_id| connection_id.0);
+        assert_eq!(
+            subscribed_connection_ids,
+            vec![remote_control_connection, stdio_connection]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_remote_control_thread_start_does_not_add_stdio_companions() -> Result<()> {
+        let manager = ThreadStateManager::new();
+        let stdio_connection = ConnectionId(1);
+        let websocket_connection = ConnectionId(2);
+        let in_process_connection = ConnectionId(3);
+
+        manager
+            .connection_initialized(
+                stdio_connection,
+                ConnectionCapabilities::default(),
+                ConnectionOrigin::Stdio,
+            )
+            .await;
+        manager
+            .connection_initialized(
+                websocket_connection,
+                ConnectionCapabilities::default(),
+                ConnectionOrigin::WebSocket,
+            )
+            .await;
+        manager
+            .connection_initialized(
+                in_process_connection,
+                ConnectionCapabilities::default(),
+                ConnectionOrigin::InProcess,
+            )
+            .await;
+
+        for request_connection_id in [
+            stdio_connection,
+            websocket_connection,
+            in_process_connection,
+        ] {
+            assert_eq!(
+                manager
+                    .local_stdio_connection_ids_for_remote_control_thread_start(
+                        request_connection_id,
+                    )
+                    .await,
+                Vec::<ConnectionId>::new()
+            );
+        }
         Ok(())
     }
 }

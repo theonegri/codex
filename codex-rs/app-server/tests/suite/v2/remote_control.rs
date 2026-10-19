@@ -11,6 +11,7 @@ use app_test_support::DEFAULT_CLIENT_NAME;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::create_fake_paginated_rollout;
+use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use codex_app_server::AppServerRuntimeOptions;
@@ -20,6 +21,7 @@ use codex_app_server::RemoteControlStartupMode;
 use codex_app_server::run_main_with_transport_options;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::InitializeCapabilities;
+use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RemoteControlClient;
@@ -38,8 +40,14 @@ use codex_app_server_protocol::RemoteControlPairingStatusResponse;
 use codex_app_server_protocol::RemoteControlStatusChangedNotification;
 use codex_app_server_protocol::RemoteControlStatusReadResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
+use codex_app_server_protocol::ThreadStartParams;
+use codex_app_server_protocol::TurnEnvironmentParams;
+use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::TurnStartedNotification;
+use codex_app_server_protocol::UserInput;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::LoaderOverrides;
 use codex_config::types::AuthCredentialsStoreMode;
@@ -614,6 +622,57 @@ async fn stdio_eof_releases_thread_writer_with_pending_remote_control_enable() -
 }
 
 #[tokio::test]
+async fn remote_control_thread_start_streams_turn_events_to_stdio() -> Result<()> {
+    let responses_server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let mut backend =
+        RemoteThreadStartBackend::start(codex_home.path(), &responses_server.uri()).await?;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+
+    let request_id = app_server.send_remote_control_enable_request().await?;
+    let _: RemoteControlEnableResponse =
+        timeout(DEFAULT_TIMEOUT, app_server.read_response(request_id)).await??;
+    let remote_thread_id = timeout(
+        DEFAULT_TIMEOUT,
+        backend.wait_until_turn_started(app_server.auto_env_params()?),
+    )
+    .await??;
+
+    let turn_started: TurnStartedNotification = timeout(
+        DEFAULT_TIMEOUT,
+        app_server.read_notification("turn/started"),
+    )
+    .await??;
+    assert_eq!(turn_started.thread_id, remote_thread_id);
+
+    let item_started: ItemStartedNotification = timeout(
+        DEFAULT_TIMEOUT,
+        app_server.read_notification("item/started"),
+    )
+    .await??;
+    assert_eq!(item_started.thread_id, remote_thread_id);
+    assert_eq!(item_started.turn_id, turn_started.turn.id);
+    let ThreadItem::UserMessage { content, .. } = item_started.item else {
+        anyhow::bail!("expected the remotely submitted user message to start");
+    };
+    assert_eq!(
+        content,
+        vec![UserInput::Text {
+            text: "Created remotely".to_string(),
+            text_elements: Vec::new(),
+        }]
+    );
+
+    let status = timeout(DEFAULT_TIMEOUT, app_server.shutdown_gracefully()).await??;
+    assert!(status.success());
+    timeout(DEFAULT_TIMEOUT, backend.wait_for_disconnect()).await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn disable_waits_for_in_flight_durable_enable() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mut backend = BlockingRemoteControlBackend::start(codex_home.path()).await?;
@@ -1038,6 +1097,12 @@ struct ConnectedRemoteControlBackend {
     _models_server: wiremock::MockServer,
 }
 
+struct RemoteThreadStartBackend {
+    thread_environment_tx: Option<oneshot::Sender<TurnEnvironmentParams>>,
+    turn_started_rx: Option<oneshot::Receiver<std::result::Result<String, String>>>,
+    server_task: JoinHandle<Result<()>>,
+}
+
 struct ClientManagementRemoteControlBackend {
     requests_rx: Option<oneshot::Receiver<Result<Vec<String>>>>,
     server_task: JoinHandle<()>,
@@ -1170,6 +1235,191 @@ impl ConnectedRemoteControlBackend {
     async fn wait_for_disconnect(&mut self) -> Result<()> {
         (&mut self.server_task).await??;
         Ok(())
+    }
+}
+
+impl RemoteThreadStartBackend {
+    async fn start(codex_home: &std::path::Path, responses_url: &str) -> Result<Self> {
+        let listener = configured_remote_control_listener(codex_home).await?;
+        let remote_control_url = format!("http://{}/backend-api/", listener.local_addr()?);
+        MockResponsesConfig::new(responses_url)
+            .with_root_config(&format!("chatgpt_base_url = \"{remote_control_url}\""))
+            .with_extra_config("[features]\napps = false")
+            .write(codex_home)?;
+        let (thread_environment_tx, thread_environment_rx) = oneshot::channel();
+        let (turn_started_tx, turn_started_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let mut turn_started_tx = Some(turn_started_tx);
+            let result: Result<()> = async {
+                let (_request_line, reader) = read_enroll_request(&listener).await?;
+                respond_with_json(
+                    reader.into_inner(),
+                    serde_json::json!({
+                        "server_id": "server-id",
+                        "environment_id": "environment-id",
+                        "remote_control_token": "remote-control-token",
+                        "expires_at": "3026-05-22T12:34:56Z",
+                    }),
+                )
+                .await?;
+
+                let (stream, _) = listener.accept().await?;
+                let mut websocket = accept_async(stream).await?;
+                send_remote_client_message(
+                    &mut websocket,
+                    /*seq_id*/ 0,
+                    serde_json::json!({
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "clientInfo": {
+                                "name": "remote-thread-test-client",
+                                "version": "0.1.0",
+                            },
+                            "capabilities": {
+                                "experimentalApi": true,
+                            },
+                        },
+                    }),
+                )
+                .await?;
+                read_remote_response(&mut websocket, /*request_id*/ 1).await?;
+                let thread_environment = thread_environment_rx
+                    .await
+                    .context("test should provide the target-native thread environment")?;
+
+                send_remote_client_message(
+                    &mut websocket,
+                    /*seq_id*/ 1,
+                    serde_json::json!({ "method": "initialized" }),
+                )
+                .await?;
+                send_remote_client_message(
+                    &mut websocket,
+                    /*seq_id*/ 2,
+                    serde_json::json!({
+                        "id": 2,
+                        "method": "thread/start",
+                        "params": serde_json::to_value(ThreadStartParams {
+                            environments: Some(vec![thread_environment]),
+                            ..Default::default()
+                        })?,
+                    }),
+                )
+                .await?;
+                let thread_start_response =
+                    read_remote_response(&mut websocket, /*request_id*/ 2).await?;
+                let thread_id = thread_start_response["result"]["thread"]["id"]
+                    .as_str()
+                    .context("thread/start response should contain a thread id")?
+                    .to_string();
+
+                send_remote_client_message(
+                    &mut websocket,
+                    /*seq_id*/ 3,
+                    serde_json::json!({
+                        "id": 3,
+                        "method": "turn/start",
+                        "params": serde_json::to_value(TurnStartParams {
+                            thread_id: thread_id.clone(),
+                            input: vec![UserInput::Text {
+                                text: "Created remotely".to_string(),
+                                text_elements: Vec::new(),
+                            }],
+                            ..Default::default()
+                        })?,
+                    }),
+                )
+                .await?;
+                read_remote_response(&mut websocket, /*request_id*/ 3).await?;
+                if let Some(turn_started_tx) = turn_started_tx.take() {
+                    let _ = turn_started_tx.send(Ok(thread_id));
+                }
+
+                while let Some(message) = websocket.next().await {
+                    match message {
+                        Ok(Message::Close(_)) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+                Ok(())
+            }
+            .await;
+
+            if let Err(err) = &result
+                && let Some(turn_started_tx) = turn_started_tx.take()
+            {
+                let _ = turn_started_tx.send(Err(err.to_string()));
+            }
+            result
+        });
+
+        Ok(Self {
+            thread_environment_tx: Some(thread_environment_tx),
+            turn_started_rx: Some(turn_started_rx),
+            server_task,
+        })
+    }
+
+    async fn wait_until_turn_started(
+        &mut self,
+        thread_environment: TurnEnvironmentParams,
+    ) -> Result<String> {
+        self.thread_environment_tx
+            .take()
+            .context("remote thread environment should only be provided once")?
+            .send(thread_environment)
+            .map_err(|_| anyhow::anyhow!("remote-control backend stopped before thread/start"))?;
+        self.turn_started_rx
+            .take()
+            .context("remote turn start should only be awaited once")?
+            .await?
+            .map_err(anyhow::Error::msg)
+    }
+
+    async fn wait_for_disconnect(&mut self) -> Result<()> {
+        (&mut self.server_task).await??;
+        Ok(())
+    }
+}
+
+async fn send_remote_client_message(
+    websocket: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+    seq_id: u64,
+    message: serde_json::Value,
+) -> Result<()> {
+    websocket
+        .send(Message::Text(
+            serde_json::json!({
+                "type": "client_message",
+                "client_id": "client-id",
+                "stream_id": "stream-id",
+                "seq_id": seq_id,
+                "message": message,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    Ok(())
+}
+
+async fn read_remote_response(
+    websocket: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+    request_id: i64,
+) -> Result<serde_json::Value> {
+    loop {
+        let message = websocket
+            .next()
+            .await
+            .context("remote control disconnected before request response")??;
+        let Message::Text(message) = message else {
+            continue;
+        };
+        let message: serde_json::Value = serde_json::from_str(&message)?;
+        if message["type"] == "server_message" && message["message"]["id"] == request_id {
+            return Ok(message["message"].clone());
+        }
     }
 }
 
@@ -1416,6 +1666,12 @@ impl Drop for BlockingRemoteControlBackend {
 }
 
 impl Drop for ConnectedRemoteControlBackend {
+    fn drop(&mut self) {
+        self.server_task.abort();
+    }
+}
+
+impl Drop for RemoteThreadStartBackend {
     fn drop(&mut self) {
         self.server_task.abort();
     }

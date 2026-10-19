@@ -329,7 +329,7 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
         let _: InitializeResponse =
             read_response_from(&mut outgoing, owner_id, /*request_id*/ 1).await;
         processor
-            .connection_initialized(owner_id, owner.request_attestation())
+            .connection_initialized(owner_id, owner.origin, owner.request_attestation())
             .await;
         send_request(
             &processor,
@@ -519,6 +519,7 @@ async fn send_request(
     processor
         .process_request(
             connection_id,
+            session.origin,
             serde_json::from_value(request).expect("JSON-RPC request"),
             &AppServerTransport::WebSocket {
                 bind_address: "127.0.0.1:0".parse().expect("loopback address"),
